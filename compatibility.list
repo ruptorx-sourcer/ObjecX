@@ -1,0 +1,8 @@
+{
+  "compatibility": [
+    {
+      "core": 100,
+      "gui": 100
+    }
+  ]
+}

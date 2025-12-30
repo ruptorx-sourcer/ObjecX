@@ -310,7 +310,7 @@ function Certificate.view(signedCert, publicKey)
     
     oldprint("[CERT] Signature chunks: " .. oldtostring(#sigChunks))
     
-    local certChunks = stringToChunks(certPart, 6)
+    local certChunks = stringToChunks(certPart, 3)
     oldprint("[CERT] Certificate chunks: " .. oldtostring(#certChunks))
     
     if #certChunks ~= #sigChunks then

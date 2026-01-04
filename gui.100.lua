@@ -1720,4 +1720,995 @@ function closeWindow(name)
 	gui.remove.window(name)
 end
 
+-- Command Dashboard (integrated into gui module)
+gui.dashboard = {}
+
+-- State variables
+local dashboardState = {
+	isOpen = false,
+	currentHeight = 30,
+	defaultHeight = 400,
+	collapsedHeight = 30,
+	window = nil,
+	searchBar = nil,
+	executeButton = nil,
+	commandList = nil,
+	selectedCommand = nil,
+	expandedCommand = nil
+}
+
+local commandCache = {}
+
+local searchState = {
+	currentQuery = "",
+	results = {},
+	lastQuery = ""
+}
+
+local historyData = {
+	commands = {},
+	maxHistory = 50,
+	historyPopup = nil,
+	isHistoryOpen = false
+}
+
+local uiElements = {
+	titleBar = nil,
+	toggleButton = nil,
+	searchContainer = nil,
+	commandScrollFrame = nil,
+	noResultsLabel = nil
+}
+
+-- Helper: Escape RichText special characters
+local function escapeRichText(text)
+	if not text then return "" end
+	text = string.gsub(text, "<", "&lt;")
+	text = string.gsub(text, ">", "&gt;")
+	text = string.gsub(text, '"', "&quot;")
+	text = string.gsub(text, "'", "&apos;")
+	return text
+end
+
+-- Helper: Strip RichText tags
+local function stripRichText(text)
+	if not text then return "" end
+	return string.gsub(text, "<[^>]+>", "")
+end
+
+-- Helper: Check if query matches string (case insensitive)
+local function fuzzyMatch(str, query)
+	if not str or not query then return false end
+	return string.lower(str):find(string.lower(query), 1, true) ~= nil
+end
+
+-- Helper: Check exact match at start
+local function exactMatch(str, query)
+	if not str or not query then return false end
+	return string.lower(str):sub(1, #query) == string.lower(query)
+end
+
+-- Helper: Highlight matching letters in text
+local function highlightMatches(text, query)
+	if not text or not query or #query == 0 then
+		return escapeRichText(text)
+	end
+	
+	local result = ""
+	local textLower = string.lower(text)
+	local queryLower = string.lower(query)
+	local queryPos = 1
+	
+	for i = 1, #text do
+		local char = text:sub(i, i)
+		local charLower = textLower:sub(i, i)
+		
+		if queryPos <= #query and charLower == queryLower:sub(queryPos, queryPos) then
+			result = result .. '<font color="rgb(45, 125, 210)">' .. escapeRichText(char) .. '</font>'
+			queryPos = queryPos + 1
+		else
+			result = result .. escapeRichText(char)
+		end
+	end
+	
+	return result
+end
+
+-- Helper: Update scroll frame canvas size
+local function updateScrollSize()
+	if not uiElements.commandScrollFrame then return end
+	
+	local totalHeight = 0
+	for _, child in ipairs(uiElements.commandScrollFrame:GetChildren()) do
+		if child:IsA("Frame") then
+			totalHeight = totalHeight + child.Size.Y.Offset
+		end
+	end
+	
+	uiElements.commandScrollFrame.CanvasSize = UDim2.new(0, 0, 0, totalHeight)
+end
+
+-- Helper: Animate height transition
+local function animateHeight(from, to, duration)
+	if not dashboardState.window then return end
+	
+	local tweenService = game:GetService("TweenService")
+	local tweenInfo = TweenInfo.new(duration or 0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	local goal = {Size = UDim2.new(dashboardState.window.Size.X.Scale, dashboardState.window.Size.X.Offset, 0, to)}
+	
+	local tween = tweenService:Create(dashboardState.window, tweenInfo, goal)
+	tween:Play()
+	
+	dashboardState.currentHeight = to
+end
+
+-- Calculate relevancy score for a command
+function gui.dashboard.calculateRelevancy(cmdData, query)
+	if not query or #query == 0 then return 0 end
+	
+	local score = 0
+	local queryLower = string.lower(query)
+	
+	-- Check name match (priority 2)
+	if fuzzyMatch(cmdData.NAME, query) then
+		score = score + 2
+		if exactMatch(cmdData.NAME, query) then
+			score = score + 1
+		end
+	end
+	
+	-- Check alias matches (priority 2)
+	if cmdData.ALIAS then
+		for _, alias in ipairs(cmdData.ALIAS) do
+			if fuzzyMatch(alias, query) then
+				score = score + 2
+				if exactMatch(alias, query) then
+					score = score + 1
+				end
+				break
+			end
+		end
+	end
+	
+	-- Check description match (priority 1, only if query is 3+ characters)
+	if #query >= 3 and cmdData.DESC and fuzzyMatch(cmdData.DESC, query) then
+		score = score + 1
+	end
+	
+	return score
+end
+
+-- Sort commands by relevancy
+function gui.dashboard.sortByRelevancy(results)
+	table.sort(results, function(a, b)
+		if a.relevancy == b.relevancy then
+			return string.lower(a.name) < string.lower(b.name)
+		end
+		return a.relevancy > b.relevancy
+	end)
+	return results
+end
+
+-- Create command entry UI element
+function gui.dashboard.createCommandEntry(cmdData, index, scale)
+	local entryHeight = 28 * scale
+	
+	local entryFrame = Instance.new("Frame")
+	entryFrame.Name = "Command_" .. cmdData.NAME
+	entryFrame.Size = UDim2.new(1, -8 * scale, 0, entryHeight)
+	entryFrame.Position = UDim2.new(0, 4 * scale, 0, (index - 1) * entryHeight)
+	entryFrame.BackgroundColor3 = palette.elementBg
+	entryFrame.BackgroundTransparency = 0.2
+	entryFrame.BorderSizePixel = 0
+	entryFrame.Parent = uiElements.commandScrollFrame
+	
+	local entryCorner = Instance.new("UICorner")
+	entryCorner.CornerRadius = UDim.new(0, 3 * scale)
+	entryCorner.Parent = entryFrame
+	
+	local nameLabel = Instance.new("TextLabel")
+	nameLabel.Name = "CommandName"
+	nameLabel.Size = UDim2.new(0.5, -8 * scale, 1, 0)
+	nameLabel.Position = UDim2.new(0, 6 * scale, 0, 0)
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Text = cmdData.NAME
+	nameLabel.RichText = true
+	nameLabel.TextColor3 = palette.text
+	nameLabel.Font = Enum.Font.GothamMedium
+	nameLabel.TextSize = 11 * scale
+	nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+	nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+	nameLabel.Parent = entryFrame
+	
+	local descLabel = Instance.new("TextLabel")
+	descLabel.Name = "CommandDesc"
+	descLabel.Size = UDim2.new(0.5, -8 * scale, 1, 0)
+	descLabel.Position = UDim2.new(0.5, 4 * scale, 0, 0)
+	descLabel.BackgroundTransparency = 1
+	descLabel.Text = cmdData.DESC or "No description"
+	descLabel.RichText = true
+	descLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+	descLabel.Font = Enum.Font.Gotham
+	descLabel.TextSize = 10 * scale
+	descLabel.TextXAlignment = Enum.TextXAlignment.Left
+	descLabel.TextTruncate = Enum.TextTruncate.AtEnd
+	descLabel.Parent = entryFrame
+	
+	local clickButton = Instance.new("TextButton")
+	clickButton.Size = UDim2.new(1, 0, 1, 0)
+	clickButton.BackgroundTransparency = 1
+	clickButton.Text = ""
+	clickButton.Parent = entryFrame
+	
+	local lastClickTime = 0
+	local doubleClickThreshold = 0.3
+	
+	clickButton.MouseButton1Click:Connect(function()
+		local currentTime = tick()
+		
+		if currentTime - lastClickTime < doubleClickThreshold then
+			gui.dashboard.expandCommand(cmdData.NAME)
+		else
+			gui.dashboard.selectCommand(cmdData.NAME)
+		end
+		
+		lastClickTime = currentTime
+	end)
+	
+	clickButton.MouseEnter:Connect(function()
+		entryFrame.BackgroundColor3 = palette.elementHover
+	end)
+	
+	clickButton.MouseLeave:Connect(function()
+		entryFrame.BackgroundColor3 = palette.elementBg
+	end)
+	
+	return entryFrame
+end
+
+-- Create expanded info section for a command
+function gui.dashboard.createExpandedInfo(cmdData, scale)
+	local expandedFrame = Instance.new("Frame")
+	expandedFrame.Name = "ExpandedInfo"
+	expandedFrame.Size = UDim2.new(1, -8 * scale, 0, 0)
+	expandedFrame.BackgroundColor3 = palette.consoleBg
+	expandedFrame.BackgroundTransparency = 0.1
+	expandedFrame.BorderSizePixel = 1
+	expandedFrame.BorderColor3 = palette.border
+	expandedFrame.BorderMode = Enum.BorderMode.Inset
+	expandedFrame.Parent = uiElements.commandScrollFrame
+	
+	local expandedCorner = Instance.new("UICorner")
+	expandedCorner.CornerRadius = UDim.new(0, 3 * scale)
+	expandedCorner.Parent = expandedFrame
+	
+	local yOffset = 8 * scale
+	local lineHeight = 16 * scale
+	
+	local nameLabel = Instance.new("TextLabel")
+	nameLabel.Size = UDim2.new(1, -16 * scale, 0, lineHeight)
+	nameLabel.Position = UDim2.new(0, 8 * scale, 0, yOffset)
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Text = "Command: " .. cmdData.NAME
+	nameLabel.TextColor3 = palette.text
+	nameLabel.Font = Enum.Font.GothamBold
+	nameLabel.TextSize = 12 * scale
+	nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+	nameLabel.Parent = expandedFrame
+	yOffset = yOffset + lineHeight + (4 * scale)
+	
+	if cmdData.ALIAS and #cmdData.ALIAS > 0 then
+		local aliasLabel = Instance.new("TextLabel")
+		aliasLabel.Size = UDim2.new(1, -16 * scale, 0, lineHeight)
+		aliasLabel.Position = UDim2.new(0, 8 * scale, 0, yOffset)
+		aliasLabel.BackgroundTransparency = 1
+		aliasLabel.Text = "Aliases: " .. table.concat(cmdData.ALIAS, ", ")
+		aliasLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+		aliasLabel.Font = Enum.Font.Gotham
+		aliasLabel.TextSize = 11 * scale
+		aliasLabel.TextXAlignment = Enum.TextXAlignment.Left
+		aliasLabel.TextTruncate = Enum.TextTruncate.AtEnd
+		aliasLabel.Parent = expandedFrame
+		yOffset = yOffset + lineHeight + (4 * scale)
+	end
+	
+	if cmdData.DESC and cmdData.DESC ~= "" then
+		local descLabel = Instance.new("TextLabel")
+		descLabel.Size = UDim2.new(1, -16 * scale, 0, lineHeight * 2)
+		descLabel.Position = UDim2.new(0, 8 * scale, 0, yOffset)
+		descLabel.BackgroundTransparency = 1
+		descLabel.Text = "Description: " .. cmdData.DESC
+		descLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+		descLabel.Font = Enum.Font.Gotham
+		descLabel.TextSize = 11 * scale
+		descLabel.TextXAlignment = Enum.TextXAlignment.Left
+		descLabel.TextYAlignment = Enum.TextYAlignment.Top
+		descLabel.TextWrapped = true
+		descLabel.Parent = expandedFrame
+		yOffset = yOffset + (lineHeight * 2) + (4 * scale)
+	end
+	
+	local closeButton = Instance.new("TextButton")
+	closeButton.Size = UDim2.new(0, 80 * scale, 0, 20 * scale)
+	closeButton.Position = UDim2.new(0.5, -(40 * scale), 0, yOffset)
+	closeButton.BackgroundColor3 = palette.elementBg
+	closeButton.BackgroundTransparency = 0.1
+	closeButton.BorderSizePixel = 1
+	closeButton.BorderColor3 = palette.border
+	closeButton.BorderMode = Enum.BorderMode.Inset
+	closeButton.Text = "Close"
+	closeButton.TextColor3 = palette.text
+	closeButton.Font = Enum.Font.GothamMedium
+	closeButton.TextSize = 10 * scale
+	closeButton.Parent = expandedFrame
+	
+	local closeCorner = Instance.new("UICorner")
+	closeCorner.CornerRadius = UDim.new(0, 3 * scale)
+	closeCorner.Parent = closeButton
+	
+	closeButton.MouseEnter:Connect(function()
+		closeButton.BackgroundColor3 = palette.elementHover
+	end)
+	
+	closeButton.MouseLeave:Connect(function()
+		closeButton.BackgroundColor3 = palette.elementBg
+	end)
+	
+	closeButton.MouseButton1Click:Connect(function()
+		gui.dashboard.collapseCommand(cmdData.NAME)
+	end)
+	
+	yOffset = yOffset + (20 * scale) + (8 * scale)
+	expandedFrame.Size = UDim2.new(1, -8 * scale, 0, yOffset)
+	
+	return expandedFrame
+end
+
+-- Populate commands from global cmds table
+function gui.dashboard.populateCommands()
+	if not cmds then
+		warn("cmds table not found")
+		return
+	end
+	
+	commandCache = {}
+	
+	for _, cmdData in ipairs(cmds) do
+		commandCache[cmdData.NAME] = {
+			name = cmdData.NAME,
+			alias = cmdData.ALIAS,
+			desc = cmdData.DESC,
+			uiEntry = nil,
+			expanded = false,
+			relevancy = 0
+		}
+	end
+end
+
+-- Refresh commands list
+function gui.dashboard.refreshCommands()
+	gui.dashboard.clearCommands()
+	gui.dashboard.populateCommands()
+	gui.dashboard.search(searchState.currentQuery)
+end
+
+-- Clear all command entries from UI
+function gui.dashboard.clearCommands()
+	if not uiElements.commandScrollFrame then return end
+	
+	for _, child in ipairs(uiElements.commandScrollFrame:GetChildren()) do
+		if child:IsA("Frame") then
+			child:Destroy()
+		end
+	end
+end
+
+-- Search and filter commands
+function gui.dashboard.search(query)
+	searchState.currentQuery = query or ""
+	searchState.results = {}
+	
+	if #searchState.currentQuery == 0 then
+		for cmdName, cmdCache in pairs(commandCache) do
+			local cmdData = nil
+			for _, cmd in ipairs(cmds) do
+				if cmd.NAME == cmdName then
+					cmdData = cmd
+					break
+				end
+			end
+			
+			if cmdData then
+				table.insert(searchState.results, {
+					name = cmdData.NAME,
+					alias = cmdData.ALIAS,
+					desc = cmdData.DESC,
+					relevancy = 0
+				})
+			end
+		end
+		
+		table.sort(searchState.results, function(a, b)
+			return string.lower(a.name) < string.lower(b.name)
+		end)
+	else
+		for cmdName, cmdCache in pairs(commandCache) do
+			local cmdData = nil
+			for _, cmd in ipairs(cmds) do
+				if cmd.NAME == cmdName then
+					cmdData = cmd
+					break
+				end
+			end
+			
+			if cmdData then
+				local relevancy = gui.dashboard.calculateRelevancy(cmdData, searchState.currentQuery)
+				
+				if relevancy > 0 then
+					table.insert(searchState.results, {
+						name = cmdData.NAME,
+						alias = cmdData.ALIAS,
+						desc = cmdData.DESC,
+						relevancy = relevancy
+					})
+				end
+			end
+		end
+		
+		searchState.results = gui.dashboard.sortByRelevancy(searchState.results)
+	end
+	
+	gui.dashboard.refreshUI()
+end
+
+-- Refresh UI with current search results
+function gui.dashboard.refreshUI()
+	gui.dashboard.clearCommands()
+	
+	if not dashboardState.window then return end
+	local scale = getScale()
+	
+	if #searchState.results == 0 then
+		if not uiElements.noResultsLabel then
+			uiElements.noResultsLabel = Instance.new("TextLabel")
+			uiElements.noResultsLabel.Name = "NoResults"
+			uiElements.noResultsLabel.Size = UDim2.new(1, 0, 0, 30 * scale)
+			uiElements.noResultsLabel.Position = UDim2.new(0, 0, 0, 20 * scale)
+			uiElements.noResultsLabel.BackgroundTransparency = 1
+			uiElements.noResultsLabel.Text = "No commands found"
+			uiElements.noResultsLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+			uiElements.noResultsLabel.Font = Enum.Font.Gotham
+			uiElements.noResultsLabel.TextSize = 12 * scale
+			uiElements.noResultsLabel.Parent = uiElements.commandScrollFrame
+		end
+	else
+		if uiElements.noResultsLabel then
+			uiElements.noResultsLabel:Destroy()
+			uiElements.noResultsLabel = nil
+		end
+		
+		for i, result in ipairs(searchState.results) do
+			local cmdData = nil
+			for _, cmd in ipairs(cmds) do
+				if cmd.NAME == result.name then
+					cmdData = cmd
+					break
+				end
+			end
+			
+			if cmdData then
+				local entry = gui.dashboard.createCommandEntry(cmdData, i, scale)
+				
+				if #searchState.currentQuery > 0 then
+					local nameLabel = entry:FindFirstChild("CommandName")
+					if nameLabel then
+						nameLabel.Text = highlightMatches(cmdData.NAME, searchState.currentQuery)
+					end
+					
+					if #searchState.currentQuery >= 3 then
+						local descLabel = entry:FindFirstChild("CommandDesc")
+						if descLabel and cmdData.DESC then
+							descLabel.Text = highlightMatches(cmdData.DESC, searchState.currentQuery)
+						end
+					end
+				end
+				
+				if dashboardState.expandedCommand == cmdData.NAME then
+					local expandedInfo = gui.dashboard.createExpandedInfo(cmdData, scale)
+					expandedInfo.Position = UDim2.new(0, 4 * scale, 0, i * (28 * scale))
+					
+					for j = i + 1, #searchState.results do
+						local nextEntry = uiElements.commandScrollFrame:FindFirstChild("Command_" .. searchState.results[j].name)
+						if nextEntry then
+							nextEntry.Position = UDim2.new(0, 4 * scale, 0, (j - 1) * (28 * scale) + expandedInfo.Size.Y.Offset)
+						end
+					end
+				end
+			end
+		end
+	end
+	
+	updateScrollSize()
+end
+
+-- Select command (autofill search bar)
+function gui.dashboard.selectCommand(cmdName)
+	dashboardState.selectedCommand = cmdName
+	
+	if dashboardState.searchBar then
+		dashboardState.searchBar.Text = cmdName
+	end
+	
+	searchState.currentQuery = ""
+	gui.dashboard.search("")
+end
+
+-- Expand command to show full info
+function gui.dashboard.expandCommand(cmdName)
+	if dashboardState.expandedCommand == cmdName then
+		gui.dashboard.collapseCommand(cmdName)
+		return
+	end
+	
+	if dashboardState.expandedCommand then
+		gui.dashboard.collapseCommand(dashboardState.expandedCommand)
+	end
+	
+	dashboardState.expandedCommand = cmdName
+	gui.dashboard.refreshUI()
+end
+
+-- Collapse expanded command
+function gui.dashboard.collapseCommand(cmdName)
+	if dashboardState.expandedCommand == cmdName then
+		dashboardState.expandedCommand = nil
+		gui.dashboard.refreshUI()
+	end
+end
+
+-- Execute command from search bar
+function gui.dashboard.executeFromBar()
+	if not dashboardState.searchBar then return end
+	
+	local cmdStr = dashboardState.searchBar.Text
+	if not cmdStr or #cmdStr == 0 then return end
+	
+	gui.dashboard.addToHistory(cmdStr)
+	
+	if execCmd then
+		execCmd(cmdStr)
+	else
+		warn("execCmd function not found")
+	end
+	
+	dashboardState.searchBar.Text = ""
+	searchState.currentQuery = ""
+	gui.dashboard.search("")
+end
+
+-- Clear search bar
+function gui.dashboard.clearBar()
+	if dashboardState.searchBar then
+		dashboardState.searchBar.Text = ""
+	end
+	searchState.currentQuery = ""
+	gui.dashboard.search("")
+end
+
+-- Add command to history
+function gui.dashboard.addToHistory(cmdStr)
+	if not cmdStr or #cmdStr == 0 then return end
+	if string.lower(cmdStr):find("^lastcmd") or string.lower(cmdStr):find("^lastcommand") then
+		return
+	end
+	
+	if historyData.commands[1] == cmdStr then
+		return
+	end
+	
+	table.insert(historyData.commands, 1, cmdStr)
+	
+	if #historyData.commands > historyData.maxHistory then
+		table.remove(historyData.commands, #historyData.commands)
+	end
+end
+
+-- Show history popup
+function gui.dashboard.showHistory()
+	if historyData.isHistoryOpen then
+		gui.dashboard.closeHistory()
+		return
+	end
+	
+	if #historyData.commands == 0 then
+		gui.add.notification("history_empty", {
+			title = "Command History",
+			desc = "No commands in history",
+			notificationType = "idle",
+			timeout = 3,
+			closeable = true
+		})
+		return
+	end
+	
+	local scale = getScale()
+	local popupWidth = 350 * scale
+	local popupHeight = math.min(400 * scale, #historyData.commands * (26 * scale) + 60 * scale)
+	
+	historyData.historyPopup = gui.add.window("CommandHistory", {
+		title = "Command History",
+		size = UDim2.new(0, popupWidth, 0, popupHeight),
+		position = UDim2.new(0.5, -(popupWidth / 2), 0.5, -(popupHeight / 2)),
+		draggable = true,
+		closeable = true,
+		visible = true,
+		elements = {}
+	})
+	
+	historyData.isHistoryOpen = true
+	
+	local historyWindow = windows["CommandHistory"]
+	if historyWindow and historyWindow.container then
+		local scrollFrame = Instance.new("ScrollingFrame")
+		scrollFrame.Size = UDim2.new(1, -8 * scale, 1, -8 * scale)
+		scrollFrame.Position = UDim2.new(0, 4 * scale, 0, 4 * scale)
+		scrollFrame.BackgroundTransparency = 1
+		scrollFrame.BorderSizePixel = 0
+		scrollFrame.ScrollBarThickness = 4 * scale
+		scrollFrame.ScrollBarImageColor3 = palette.text
+		scrollFrame.ScrollBarImageTransparency = 0.6
+		scrollFrame.CanvasSize = UDim2.new(0, 0, 0, #historyData.commands * (26 * scale))
+		scrollFrame.Parent = historyWindow.container
+		
+		for i, cmdStr in ipairs(historyData.commands) do
+			local entryFrame = Instance.new("Frame")
+			entryFrame.Name = "HistoryEntry_" .. i
+			entryFrame.Size = UDim2.new(1, -8 * scale, 0, 24 * scale)
+			entryFrame.Position = UDim2.new(0, 4 * scale, 0, (i - 1) * (26 * scale))
+			entryFrame.BackgroundColor3 = palette.elementBg
+			entryFrame.BackgroundTransparency = 0.2
+			entryFrame.BorderSizePixel = 0
+			entryFrame.Parent = scrollFrame
+			
+			local entryCorner = Instance.new("UICorner")
+			entryCorner.CornerRadius = UDim.new(0, 3 * scale)
+			entryCorner.Parent = entryFrame
+			
+			local cmdLabel = Instance.new("TextLabel")
+			cmdLabel.Size = UDim2.new(1, -8 * scale, 1, 0)
+			cmdLabel.Position = UDim2.new(0, 4 * scale, 0, 0)
+			cmdLabel.BackgroundTransparency = 1
+			cmdLabel.Text = cmdStr
+			cmdLabel.TextColor3 = palette.text
+			cmdLabel.Font = Enum.Font.RobotoMono
+			cmdLabel.TextSize = 11 * scale
+			cmdLabel.TextXAlignment = Enum.TextXAlignment.Left
+			cmdLabel.TextTruncate = Enum.TextTruncate.AtEnd
+			cmdLabel.Parent = entryFrame
+			
+			local clickButton = Instance.new("TextButton")
+			clickButton.Size = UDim2.new(1, 0, 1, 0)
+			clickButton.BackgroundTransparency = 1
+			clickButton.Text = ""
+			clickButton.Parent = entryFrame
+			
+			clickButton.MouseButton1Click:Connect(function()
+				gui.dashboard.executeFromHistory(i)
+				gui.dashboard.closeHistory()
+			end)
+			
+			clickButton.MouseEnter:Connect(function()
+				entryFrame.BackgroundColor3 = palette.elementHover
+			end)
+			
+			clickButton.MouseLeave:Connect(function()
+				entryFrame.BackgroundColor3 = palette.elementBg
+			end)
+		end
+	end
+end
+
+-- Close history popup
+function gui.dashboard.closeHistory()
+	if historyData.historyPopup then
+		gui.remove.window("CommandHistory")
+		historyData.historyPopup = nil
+		historyData.isHistoryOpen = false
+	end
+end
+
+-- Clear all history
+function gui.dashboard.clearHistory()
+	historyData.commands = {}
+	if historyData.isHistoryOpen then
+		gui.dashboard.closeHistory()
+	end
+end
+
+-- Get history table
+function gui.dashboard.getHistory()
+	return historyData.commands
+end
+
+-- Execute command from history by index
+function gui.dashboard.executeFromHistory(index)
+	if not historyData.commands[index] then return end
+	
+	local cmdStr = historyData.commands[index]
+	
+	if dashboardState.searchBar then
+		dashboardState.searchBar.Text = cmdStr
+	end
+	
+	gui.dashboard.executeFromBar()
+end
+
+-- Execute last command
+function gui.dashboard.executeLastCommand()
+	if #historyData.commands == 0 then
+		gui.add.notification("no_history", {
+			title = "No History",
+			desc = "No previous commands to execute",
+			notificationType = "idle",
+			timeout = 3,
+			closeable = true
+		})
+		return
+	end
+	
+	gui.dashboard.executeFromHistory(1)
+end
+
+-- Toggle open/closed state
+function gui.dashboard.toggle()
+	if dashboardState.isOpen then
+		gui.dashboard.close()
+	else
+		gui.dashboard.open()
+	end
+end
+
+-- Open dashboard
+function gui.dashboard.open()
+	if dashboardState.isOpen then return end
+	
+	dashboardState.isOpen = true
+	
+	if uiElements.searchContainer then
+		uiElements.searchContainer.Visible = true
+	end
+	
+	if uiElements.commandScrollFrame then
+		uiElements.commandScrollFrame.Visible = true
+	end
+	
+	animateHeight(dashboardState.collapsedHeight, dashboardState.defaultHeight, 0.25)
+	
+	if uiElements.toggleButton then
+		uiElements.toggleButton.Text = "▼"
+	end
+end
+
+-- Close dashboard
+function gui.dashboard.close()
+	if not dashboardState.isOpen then return end
+	
+	dashboardState.isOpen = false
+	
+	if uiElements.searchContainer then
+		uiElements.searchContainer.Visible = false
+	end
+	
+	if uiElements.commandScrollFrame then
+		uiElements.commandScrollFrame.Visible = false
+	end
+	
+	animateHeight(dashboardState.defaultHeight, dashboardState.collapsedHeight, 0.25)
+	
+	if uiElements.toggleButton then
+		uiElements.toggleButton.Text = "▶"
+	end
+end
+
+-- Check if dashboard is open
+function gui.dashboard.isOpen()
+	return dashboardState.isOpen
+end
+
+-- Update state
+function gui.dashboard.updateState(newState)
+	if newState == "open" then
+		gui.dashboard.open()
+	elseif newState == "closed" then
+		gui.dashboard.close()
+	end
+end
+
+-- Destroy dashboard
+function gui.dashboard.destroy()
+	if dashboardState.window then
+		gui.remove.window("CommandDashboard")
+	end
+	
+	dashboardState = {
+		isOpen = false,
+		currentHeight = 30,
+		defaultHeight = 400,
+		collapsedHeight = 30,
+		window = nil,
+		searchBar = nil,
+		executeButton = nil,
+		commandList = nil,
+		selectedCommand = nil,
+		expandedCommand = nil
+	}
+	
+	commandCache = {}
+	searchState = {currentQuery = "", results = {}, lastQuery = ""}
+	uiElements = {}
+end
+
+-- Initialize dashboard
+function gui.dashboard.init()
+	local scale = getScale()
+	local dashboardWidth = 500 * scale
+	
+	dashboardState.window = gui.add.window("CommandDashboard", {
+		title = "Command Dashboard",
+		size = UDim2.new(0, dashboardWidth, 0, dashboardState.collapsedHeight),
+		position = UDim2.new(0.5, -(dashboardWidth / 2), 0, 50 * scale),
+		draggable = true,
+		closeable = false,
+		visible = true,
+		elements = {}
+	})
+	
+	local windowData = windows["CommandDashboard"]
+	if not windowData then
+		warn("Failed to create dashboard window")
+		return
+	end
+	
+	uiElements.titleBar = windowData.frame:FindFirstChild("TitleBar")
+	
+	local toggleButton = Instance.new("TextButton")
+	toggleButton.Name = "ToggleButton"
+	toggleButton.Size = UDim2.new(0, 20 * scale, 0, 16 * scale)
+	toggleButton.Position = UDim2.new(1, -(24 * scale), 0, 3 * scale)
+	toggleButton.BackgroundColor3 = palette.elementBg
+	toggleButton.BackgroundTransparency = 0.2
+	toggleButton.BorderSizePixel = 0
+	toggleButton.Text = "▶"
+	toggleButton.TextColor3 = palette.text
+	toggleButton.Font = Enum.Font.GothamBold
+	toggleButton.TextSize = 10 * scale
+	toggleButton.ZIndex = windowData.frame.ZIndex + 1
+	toggleButton.Parent = uiElements.titleBar
+	
+	local toggleCorner = Instance.new("UICorner")
+	toggleCorner.CornerRadius = UDim.new(0, 3 * scale)
+	toggleCorner.Parent = toggleButton
+	
+	uiElements.toggleButton = toggleButton
+	
+	toggleButton.MouseButton1Click:Connect(function()
+		gui.dashboard.toggle()
+	end)
+	
+	toggleButton.MouseEnter:Connect(function()
+		toggleButton.BackgroundColor3 = palette.elementHover
+	end)
+	
+	toggleButton.MouseLeave:Connect(function()
+		toggleButton.BackgroundColor3 = palette.elementBg
+	end)
+	
+	local searchContainer = Instance.new("Frame")
+	searchContainer.Name = "SearchContainer"
+	searchContainer.Size = UDim2.new(1, -8 * scale, 0, 28 * scale)
+	searchContainer.Position = UDim2.new(0, 4 * scale, 0, 26 * scale)
+	searchContainer.BackgroundTransparency = 1
+	searchContainer.Visible = false
+	searchContainer.Parent = windowData.container
+	
+	uiElements.searchContainer = searchContainer
+	
+	local executeButton = Instance.new("TextButton")
+	executeButton.Name = "ExecuteButton"
+	executeButton.Size = UDim2.new(0, 24 * scale, 0, 24 * scale)
+	executeButton.Position = UDim2.new(0, 0, 0, 2 * scale)
+	executeButton.BackgroundColor3 = palette.sliderFill
+	executeButton.BackgroundTransparency = 0.1
+	executeButton.BorderSizePixel = 0
+	executeButton.Text = ">"
+	executeButton.TextColor3 = palette.text
+	executeButton.Font = Enum.Font.GothamBold
+	executeButton.TextSize = 14 * scale
+	executeButton.Parent = searchContainer
+	
+	local execCorner = Instance.new("UICorner")
+	execCorner.CornerRadius = UDim.new(0, 3 * scale)
+	execCorner.Parent = executeButton
+	
+	dashboardState.executeButton = executeButton
+	
+	executeButton.MouseButton1Click:Connect(function()
+		gui.dashboard.executeFromBar()
+	end)
+	
+	executeButton.MouseEnter:Connect(function()
+		executeButton.BackgroundColor3 = Color3.fromRGB(65, 145, 230)
+	end)
+	
+	executeButton.MouseLeave:Connect(function()
+		executeButton.BackgroundColor3 = palette.sliderFill
+	end)
+	
+	local searchBar = Instance.new("TextBox")
+	searchBar.Name = "SearchBar"
+	searchBar.Size = UDim2.new(1, -(28 * scale), 0, 24 * scale)
+	searchBar.Position = UDim2.new(0, 28 * scale, 0, 2 * scale)
+	searchBar.BackgroundColor3 = palette.elementBg
+	searchBar.BackgroundTransparency = 0.1
+	searchBar.BorderSizePixel = 1
+	searchBar.BorderColor3 = palette.border
+	searchBar.BorderMode = Enum.BorderMode.Inset
+	searchBar.PlaceholderText = "Search or execute command..."
+	searchBar.Text = ""
+	searchBar.TextColor3 = palette.text
+	searchBar.PlaceholderColor3 = Color3.fromRGB(150, 150, 150)
+	searchBar.Font = Enum.Font.Gotham
+	searchBar.TextSize = 11 * scale
+	searchBar.TextXAlignment = Enum.TextXAlignment.Left
+	searchBar.ClearTextOnFocus = false
+	searchBar.Parent = searchContainer
+	
+	local searchCorner = Instance.new("UICorner")
+	searchCorner.CornerRadius = UDim.new(0, 3 * scale)
+	searchCorner.Parent = searchBar
+	
+	local searchPadding = Instance.new("UIPadding")
+	searchPadding.PaddingLeft = UDim.new(0, 6 * scale)
+	searchPadding.PaddingRight = UDim.new(0, 6 * scale)
+	searchPadding.Parent = searchBar
+	
+	dashboardState.searchBar = searchBar
+	
+	searchBar:GetPropertyChangedSignal("Text"):Connect(function()
+		local text = searchBar.Text
+		if text ~= searchState.currentQuery then
+			gui.dashboard.search(text)
+		end
+	end)
+	
+	searchBar.FocusLost:Connect(function(enterPressed)
+		if enterPressed then
+			gui.dashboard.executeFromBar()
+		end
+	end)
+	
+	local commandScrollFrame = Instance.new("ScrollingFrame")
+	commandScrollFrame.Name = "CommandList"
+	commandScrollFrame.Size = UDim2.new(1, -8 * scale, 1, -(60 * scale))
+	commandScrollFrame.Position = UDim2.new(0, 4 * scale, 0, 58 * scale)
+	commandScrollFrame.BackgroundTransparency = 1
+	commandScrollFrame.BorderSizePixel = 0
+	commandScrollFrame.ScrollBarThickness = 4 * scale
+	commandScrollFrame.ScrollBarImageColor3 = palette.text
+	commandScrollFrame.ScrollBarImageTransparency = 0.6
+	commandScrollFrame.CanvasSize = UDim2.new(0, 0, 0, 0)
+	commandScrollFrame.Visible = false
+	commandScrollFrame.Parent = windowData.container
+	
+	uiElements.commandScrollFrame = commandScrollFrame
+	dashboardState.commandList = commandScrollFrame
+	
+	gui.dashboard.populateCommands()
+	gui.dashboard.search("")
+	
+	gui.registerCallback("dashboard_execute", gui.dashboard.executeFromBar)
+	gui.registerCallback("dashboard_toggle", gui.dashboard.toggle)
+	gui.registerCallback("dashboard_history", gui.dashboard.showHistory)
+end
+
 return gui

@@ -1723,7 +1723,7 @@ end
 -- Command Dashboard (integrated into gui module)
 gui.dashboard = {}
 
-local WATERMARK_IMAGE_ID = "rbxassetid://0000000000"
+local WATERMARK_IMAGE_ID = "rbxassetid://82808466179314"
 local WATERMARK_FALLBACK_TEXT = "ObjecX"
 
 local dashboardState = {
